@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+
+import certifi
+import click
+import json
+import os
+from retrying import retry
+import sys
+import time
+from urllib.parse import quote
+import urllib3
+
+class Config(object):
+    api = 'https://api-service.example.com'
+
+class QueryCockup(Exception):
+    pass
+
+@retry(stop_max_attempt_number=16, wait_exponential_multiplier=2000, wait_exponential_max=15000, wait_jitter_max=1000)
+def query_http(func, *args, **kwargs):
+    my_kwargs = kwargs
+    if 'U' in os.environ and 'P' in os.environ:
+        a = urllib3.util.make_headers(basic_auth='{}:{}'.format(os.environ['U'], os.environ['P']))
+    else:
+        a = {}
+    if 'headers' not in my_kwargs:
+        my_kwargs['headers'] = {}
+    my_kwargs['headers'].update(a)
+    r = func(*args, **my_kwargs)
+    if int(r.status) < 200 or int(r.status) > 299:
+        raise QueryCockup("Request {} {} failed with status '{}':\n{}".format(args, kwargs, r.status, r.data))
+    return r
+
+def setup_pool_manager(ssl_verify=True):
+    return urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
+
+def wait_for_task(ref, http, wait=300, step=1):
+    counter=0
+    while int(counter) < wait:
+        q = query_http(http.request, 'GET', '{}/{}'.format(Config.api, ref))
+        if json.loads(q.data.decode('utf-8'))["status"] == "SUCCEEDED":
+            break
+        time.sleep(step)
+        counter = counter + step
+    if json.loads(q.data.decode('utf-8'))["status"] != "SUCCEEDED" and counter >= wait:
+        raise QueryCockup("Create task did not succeed in a given timeframe '{}'s: {}".format(wait, json.loads(q.data.decode('utf-8'))["status"]))
+
+@click.group()
+def cli():
+    pass
+
+@cli.command()
+@click.option('--app',             '-a', required=True)
+@click.option('--stage',           '-s', required=True)
+@click.option('--trigger',         '-t', required=False)
+@click.option('--trigger-enabled', '-e', required=False, default=False, is_flag=True)
+@click.argument('pipeline_json_file')
+def pipeline(app, stage, trigger, trigger_enabled, pipeline_json_file):
+    http = setup_pool_manager()
+    triggers = []
+    if trigger:
+        r = query_http(http.request, 'GET', '{}/applications/{}/pipelineConfigs/{}'.format(Config.api, app, quote(trigger)))
+        trigger_pippeline_definition = json.loads(r.data.decode('utf-8'))
+        triggers = [{ "application": app,
+                      "enabled": trigger_enabled,
+                      "pipeline": trigger_pippeline_definition["id"],
+                      "status": [ "successful" ],
+                      "type": "pipeline" }]
+
+    r = query_http(http.request, 'GET', '{}/applications/{}/pipelineConfigs/{}'.format(Config.api, app, quote(stage)))
+    if r.data.decode('utf-8'):
+        old_pipeline_definition = json.loads(r.data.decode('utf-8'))
+    else:
+        old_pipeline_definition = False
+
+    with open(pipeline_json_file) as fh:
+        new_pipeline_definition = json.load(fh)
+    new_pipeline_definition["application"] = app
+    new_pipeline_definition["name"] = stage
+    if old_pipeline_definition:
+        new_pipeline_definition["id"] = old_pipeline_definition["id"]
+    new_pipeline_definition["index"] = 0
+    new_pipeline_definition["triggers"] = triggers
+
+    r = query_http(http.request, 'POST', '{}/pipelines'.format(Config.api), body=json.dumps(new_pipeline_definition), headers={'Content-Type': 'application/json; charset=UTF-8'})
+    click.echo('{} {}'.format(r.status, r.data.decode('utf-8')))
+
+@cli.command()
+@click.option('--app', '-a', required=True)
+@click.argument('monitoring_links_file')
+def links(app, monitoring_links_file):
+    with open(monitoring_links_file) as fh:
+        monitoring_links_definition = json.load(fh)
+    template = {
+                   'job': [{
+                       'type': 'updateApplication',
+                       'user': 'jenkins',
+                       'application': {
+                           'name': app,
+                           'instanceLinks': monitoring_links_definition,
+                       }
+                   }],
+                   'application': app,
+                   'description': 'Update Application (links): {}'.format(app)
+               }
+    http = setup_pool_manager()
+    r = query_http(http.request, 'POST', '{}/applications/{}/tasks'.format(Config.api, app), body=json.dumps(template), headers={'Content-Type': 'application/context+json'})
+    click.echo('{} {}'.format(r.status, r.data.decode('utf-8')))
+
+@cli.command()
+@click.option('--app',  '-a', required=True)
+@click.option('--wait', '-w', default=300)
+@click.argument('create_app_file')
+def create(app, wait, create_app_file):
+    with open(create_app_file) as fh:
+        create_app_definition = json.load(fh)
+    http = setup_pool_manager()
+    r = query_http(http.request, 'POST', '{}/applications/{}/tasks'.format(Config.api, app), body=json.dumps(create_app_definition), headers={'Content-Type': 'application/json; charset=utf-8'})
+    click.echo('{} {}'.format(r.status, r.data.decode('utf-8')))
+
+    wait_for_task(json.loads(r.data.decode('utf-8'))["ref"], http=http, wait=wait, step=0.5)
+
+@cli.command()
+@click.option('--app',   '-a', required=True)
+@click.option('--stage', '-s', required=True)
+@click.option('--wait', '-w', default=900)
+@click.argument('create_policy_file')
+def addpolicy(app, stage, wait, create_policy_file):
+    with open(create_policy_file) as fh:
+        create_policy_definition = json.load(fh)
+    create_policy_definition['credentials'] = stage
+    http = setup_pool_manager()
+    r = query_http(http.request, 'GET', '{}/applications/{}'.format(Config.api, app))
+    try:
+        srv_groups = json.loads(r.data.decode('utf-8'))['clusters'][stage]
+    except KeyError:
+        click.echo("No clusters for {} stage".format(stage))
+        sys.exit()
+
+    for e in srv_groups:
+        e['serverGroups'].sort
+        for sg in e['serverGroups'][-2:]:
+            create_policy_definition['serverGroupName'] = sg
+            job = { 'application': app, 'description': 'Upsert a policy for {}'.format(create_policy_definition['name']), 'job': [ create_policy_definition ] }
+            r = query_http(http.request, 'POST', '{}/applications/{}/tasks'.format(Config.api, app), body=json.dumps(job), headers={'Content-Type': 'application/json;charset=utf-8'})
+            click.echo('Upserting policy ({}): {} - {} {}'.format(sg, create_policy_definition['name'], r.status, r.data.decode('utf-8')))
+            wait_for_task(json.loads(r.data.decode('utf-8'))["ref"], http=http, wait=wait, step=0.5)
+
+@cli.command()
+@click.option('--app',   '-a', required=True)
+@click.option('--stage', '-s', required=True)
+@click.option('--wait', '-w', default=900)
+def clearpolicies(app, stage, wait):
+    http = setup_pool_manager()
+    r = query_http(http.request, 'GET', '{}/applications/{}'.format(Config.api, app))
+    try:
+        srv_groups = json.loads(r.data.decode('utf-8'))['clusters'][stage]
+    except KeyError:
+        click.echo("No clusters for {} stage".format(stage))
+        sys.exit()
+
+    for e in srv_groups:
+        e['serverGroups'].sort
+        for sg in e['serverGroups'][-2:]:
+            try:
+                r = query_http(http.request, 'GET', '{}/applications/{}/serverGroups/{}/eu-west-1/{}'.format(Config.api, app, stage, sg))
+            except QueryCockup:
+                continue
+            try:
+                policies = json.loads(r.data.decode('utf-8'))['scalingPolicies']
+            except KeyError:
+                continue
+            for p in policies:
+                remove = {
+                           'application': app,
+                           'description': 'Remove policy {}'.format(p['policyName']),
+                           'job': [
+                             {
+                               'type': 'deleteScalingPolicy',
+                               'cloudProvider': 'aws',
+                               'credentials': stage,
+                               'region': 'eu-west-1',
+                               'policyName': p['policyName'],
+                               'serverGroupName': sg,
+                               'user': 'jenkins'
+                             }
+                           ]
+                         }
+                r = query_http(http.request, 'POST', '{}/applications/{}/tasks'.format(Config.api, app), body=json.dumps(remove), headers={'Content-Type': 'application/json;charset=utf-8'})
+                click.echo('Deleting policy ({}): {} - {} {}'.format(sg, p['policyName'], r.status, r.data.decode('utf-8')))
+                wait_for_task(json.loads(r.data.decode('utf-8'))["ref"], http=http, wait=wait, step=0.5)
+
+if __name__ == '__main__':
+    cli()
